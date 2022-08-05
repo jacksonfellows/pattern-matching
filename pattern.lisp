@@ -1,3 +1,13 @@
+(ql:quickload '(:alexandria :cl-dot))
+
+(defpackage :pattern-matching
+  (:import-from :alexandria :appendf :when-let :if-let)
+  (:use cl))
+
+(in-package :pattern-matching)
+
+;;; NFA implementation
+
 (defclass nfa ()
   ((states
     :initform (make-hash-table)
@@ -56,6 +66,8 @@
   (when (is-final-state? n state)
     (setf (final-states n) (delete state (final-states n)))))
 
+;;; Pattern -> NFA
+
 (defun make-edge (pattern)
   `',pattern)
 
@@ -110,13 +122,8 @@
     (add-final-state n (compile-pattern n pattern initial))
     n))
 
-(defun partition (predicate list)
-  (loop for elem in list
-	if (funcall predicate elem)
-	  collect elem into true
-	else
-	  collect elem into false
-	finally (return (values true false))))
+;;; Optimize/simplify NFAs
+;;; TODO: combine equivalent states
 
 (defun remove-eps-transitions (n)
   (labels ((rec ()
@@ -171,7 +178,96 @@
   (make-1-initial-state n)
   (remove-unreachable-states n))
 
-(ql:quickload :cl-dot)
+;;; Match NFA
+
+(defstruct matching-state
+  (indices '())
+  (var-starts '())
+  (captures '()))
+
+(defun deep-copy-matching-state (matching-state)
+  (let ((copy (copy-matching-state matching-state)))
+    (setf (matching-state-indices copy) (copy-list (matching-state-indices copy)))
+    (setf (matching-state-var-starts copy) (copy-list (matching-state-var-starts copy)))
+    (setf (matching-state-captures copy) (copy-list (matching-state-captures copy)))
+    copy))
+
+(defun incf-last-index (matching-state)
+  (unless (null (matching-state-indices matching-state))
+    (incf (car (last (matching-state-indices matching-state))))))
+
+(defun index-expression (expression indices)
+  (if (null indices)
+      (values expression t)
+      (if (or (not (listp expression)) (>= (car indices) (length expression)))
+	  (values nil nil)
+	  (index-expression (elt expression (car indices)) (cdr indices)))))
+
+(defun match-rec (nfa state expression matching-state)
+  (flet ((dup-state ()
+	   (deep-copy-matching-state matching-state)))
+    (multiple-value-bind (subexpression in-bounds?)
+	(index-expression expression (matching-state-indices matching-state))
+      (loop for (edge . dest) in (get-transitions nfa state)
+	    do (cond
+		 ((eql 'down edge)
+		  (when (and in-bounds? (listp subexpression))
+		    (let ((new-matching-state (dup-state)))
+		      (appendf (matching-state-indices new-matching-state) '(0))
+		      (when-let ((res (match-rec nfa dest expression new-matching-state)))
+			(return res)))))
+		 ((eql 'up edge)
+		  (when (= (length (index-expression expression (butlast (matching-state-indices matching-state))))
+			   (car (last (matching-state-indices matching-state))))
+		    (let ((new-matching-state (dup-state)))
+		      (setf (matching-state-indices new-matching-state) (butlast (matching-state-indices new-matching-state)))
+		      (incf-last-index new-matching-state)
+		      (when-let ((res (match-rec nfa dest expression new-matching-state)))
+			(return res)))))
+		 ((eql 'any edge)
+		  (when in-bounds?
+		    (let ((new-matching-state (dup-state)))
+		      (incf-last-index new-matching-state)
+		      (when-let ((res (match-rec nfa dest expression new-matching-state)))
+			(return res)))))
+		 ((and (listp edge) (eql 'quote (car edge)))
+		  (when (and in-bounds? (equal subexpression (second edge)))
+		    (let ((new-matching-state (dup-state)))
+		      (incf-last-index new-matching-state)
+		      (when-let ((res (match-rec nfa dest expression new-matching-state)))
+			(return res)))))
+		 ((and (listp edge) (eql 'start-var (car edge)))
+		  (let ((new-matching-state (dup-state)))
+		    (push (cons (second edge) (car (last (matching-state-indices new-matching-state)))) (matching-state-var-starts new-matching-state))
+		    (when-let ((res (match-rec nfa dest expression new-matching-state)))
+		      (return res))))
+		 ((and (listp edge) (eql 'end-var (car edge)))
+		  (let* ((var (second edge))
+			 (up-level (index-expression expression (butlast (matching-state-indices matching-state))))
+			 (capture
+			   (if (listp up-level)
+			       (subseq up-level (cdr (assoc var (matching-state-var-starts matching-state))) (car (last (matching-state-indices matching-state))))
+			       up-level))
+			 (capture (if (and (listp capture) (= 1 (length capture)))
+				      (car capture)
+				      `(sequence ,@ capture))))
+		    (if (member var (matching-state-captures matching-state) :key #'car)
+			(when (equal capture (cdr (assoc var (matching-state-captures matching-state))))
+			  (when-let ((res (match-rec nfa dest expression matching-state)))
+			    (return res)))
+			(let ((new-matching-state (dup-state)))
+			  (push (cons var capture) (matching-state-captures new-matching-state))
+			  (when-let ((res (match-rec nfa dest expression new-matching-state)))
+			    (return res)))))))
+	    finally (return (if (is-final-state? nfa state) (if-let ((res (matching-state-captures matching-state))) res t) nil))))))
+
+(defun match (nfa expression)
+  (loop for state in (get-initial-states nfa)
+	do (when-let ((res (match-rec nfa state expression (make-matching-state))))
+	     (return res))
+	finally (return nil)))
+
+;;; Plot NFAs
 
 (defmethod cl-dot:graph-object-node ((graph nfa) object)
   (make-instance 'cl-dot:node
