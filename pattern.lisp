@@ -71,13 +71,24 @@
 (defun make-edge (pattern)
   `',pattern)
 
-(defun compile-sequence (n sequence current-state)
-  (if (null sequence)
-      current-state
-      (let ((next (compile-pattern n (car sequence) current-state)))
-	(compile-sequence n (cdr sequence) next))))
+(defun compile-sequence (n sequence current-state &optional &key (orderless nil))
+  (reduce
+   (lambda (state subpattern)
+     (compile-pattern n subpattern state :orderless orderless))
+   sequence
+   :initial-value current-state))
 
-(defun compile-pattern (n pattern current-state)
+(defvar *orderless-symbols* '(+ *))
+
+(defun orderless? (symbol)
+  (member symbol *orderless-symbols*))
+
+(defun compile-orderless (n pattern current-state)
+  (let ((new-state (new-state n)))
+    (add-edge n current-state new-state (make-edge (car pattern)))
+    (compile-sequence n (cdr pattern) new-state :orderless t)))
+
+(defun compile-pattern (n pattern current-state &optional &key (orderless nil))
   (if (listp pattern)
       (case (car pattern)
 	(alternative
@@ -86,33 +97,43 @@
 	       (end (new-state n)))
 	   (add-edge n current-state a 'eps)
 	   (add-edge n current-state b 'eps)
-	   (add-edge n (compile-pattern n (second pattern) a) end 'eps)
-	   (add-edge n (compile-pattern n (third pattern) b) end 'eps)
+	   (add-edge n (compile-pattern n (second pattern) a :orderless orderless) end 'eps)
+	   (add-edge n (compile-pattern n (third pattern) b :orderless orderless) end 'eps)
 	   end))
 	(repeated
 	 (let* ((start (new-state n))
 		(end (new-state n))
-		(x (compile-pattern n (second pattern) start)))
+		(x (compile-pattern n (second pattern) start :orderless orderless)))
 	   (add-edge n current-state start 'eps)
 	   (add-edge n x start 'eps)
 	   (add-edge n x end 'eps)
 	   end))
 	(any
 	 (let ((end (new-state n)))
-	   (add-edge n current-state end 'any)
+	   (add-edge n current-state end (if orderless '(orderless any) 'any))
 	   end))
 	(pattern
-	 (error "unsupported"))
-	(sequence
-	 (compile-sequence n (cdr pattern) current-state))
+	 (let ((start (new-state n))
+	       (end (new-state n)))
+	   (add-edge n current-state start (if orderless `(orderless (start-var ,(second pattern))) `(start-var ,(second pattern))))
+	   (add-edge n (compile-pattern n (third pattern) start :orderless orderless) end (if orderless `(orderless (end-var ,(second pattern))) `(end-var ,(second pattern))))
+	   end))
+	(patternsequence
+	 (compile-sequence n (cdr pattern) current-state :orderless orderless))
 	(otherwise
 	 (let ((start (new-state n))
 	       (end (new-state n)))
-	   (add-edge n current-state start 'down)
-	   (add-edge n (compile-sequence n pattern start) end 'up)
+	   (add-edge n current-state start (if orderless '(orderless down) 'down))
+	   (let ((pattern-orderless? (and (not (null pattern)) (orderless? (car pattern)))))
+	     (add-edge
+	      n
+	      (cond
+		(pattern-orderless? (compile-orderless n pattern start))
+		(t (compile-sequence n pattern start)))
+	      end (if pattern-orderless? '(orderless up) 'up)))
 	   end)))
       (let ((next (new-state n)))
-	(add-edge n current-state next (make-edge pattern))
+	(add-edge n current-state next (if orderless `(orderless ,(make-edge pattern)) (make-edge pattern)))
 	next)))
 
 (defun pattern->nfa (pattern)
@@ -183,13 +204,15 @@
 (defstruct matching-state
   (indices '())
   (var-starts '())
-  (captures '()))
+  (captures '())
+  (orderless-visited '()))
 
 (defun deep-copy-matching-state (matching-state)
   (let ((copy (copy-matching-state matching-state)))
     (setf (matching-state-indices copy) (copy-list (matching-state-indices copy)))
-    (setf (matching-state-var-starts copy) (copy-list (matching-state-var-starts copy)))
-    (setf (matching-state-captures copy) (copy-list (matching-state-captures copy)))
+    (setf (matching-state-var-starts copy) (copy-alist (matching-state-var-starts copy)))
+    (setf (matching-state-captures copy) (copy-alist (matching-state-captures copy)))
+    (setf (matching-state-orderless-visited copy) (copy-alist (matching-state-orderless-visited copy)))
     copy))
 
 (defun incf-last-index (matching-state)
@@ -203,27 +226,56 @@
 	  (values nil nil)
 	  (index-expression (elt expression (car indices)) (cdr indices)))))
 
-(defun get-capture (expression matching-state var)
+(defun get-capture (expression matching-state var orderless?)
   (let* ((up-level (index-expression expression (butlast (matching-state-indices matching-state))))
+	 (start (cdr (assoc var (matching-state-var-starts matching-state))))
 	 (capture
 	   (if (listp up-level)
-	       (subseq up-level (cdr (assoc var (matching-state-var-starts matching-state))) (car (last (matching-state-indices matching-state))))
+	       (if orderless?
+		   (mapcar (lambda (i) (elt up-level i)) (subseq (get-orderless-visited matching-state) start))
+		   (subseq up-level start (car (last (matching-state-indices matching-state)))))
 	       up-level))
 	 (capture (if (and (listp capture) (= 1 (length capture)))
 		      (car capture)
 		      `(sequence ,@ capture))))
     capture))
 
+(defun get-orderless-visited (matching-state)
+  (let ((depth (1- (length (matching-state-indices matching-state)))))
+    (if-let ((visited (cdr (assoc depth (matching-state-orderless-visited matching-state)))))
+      visited
+      (let ((visited '()))
+	(push (cons depth visited) (matching-state-orderless-visited matching-state))
+	visited))))
+
+(defun add-visited-index (matching-state index)
+  (let ((depth (1- (length (matching-state-indices matching-state)))))
+    (appendf (cdr (assoc depth (matching-state-orderless-visited matching-state))) (list index))))
+
 (defun match-rec (nfa state expression matching-state)
-  (macrolet ((try (new-matching-state &body body)
+  (macrolet ((try ((new-matching-state) &body body)
 	       `(let ((,new-matching-state (deep-copy-matching-state matching-state)))
 		  (multiple-value-bind (res matched)
 		      (match-rec nfa (progn ,@body) expression ,new-matching-state)
 		    (when matched
+		      (return (values res matched))))))
+	     (try-orderless-possibilities ((new-matching-state index) predicate &body body)
+	       `(let ((list (cdr (index-expression expression (butlast (matching-state-indices matching-state)))))
+		      (visited (get-orderless-visited matching-state)))
+		  (multiple-value-bind (res matched)
+		      (loop for elem in list and ,index from 1
+			    when (and (not (member ,index visited)) (funcall ,predicate elem))
+			      do (multiple-value-bind (res matched)
+				     (let ((,new-matching-state (deep-copy-matching-state matching-state)))
+				       (match-rec nfa (progn ,@body) expression ,new-matching-state))
+				   (when matched
+				     (return (values res matched)))))
+		    (when matched
 		      (return (values res matched)))))))
     (multiple-value-bind (subexpression in-bounds?)
 	(index-expression expression (matching-state-indices matching-state))
-      (dolist (transition (get-transitions nfa state) (values (matching-state-captures matching-state) (if (is-final-state? nfa state) t nil)))
+      (dolist (transition (get-transitions nfa state)
+			  (values (matching-state-captures matching-state) (if (is-final-state? nfa state) t nil)))
 	(let* ((edge (car transition))
 	       (dest (cdr transition))
 	       (orderless? (and (listp edge) (eql 'orderless (car edge))))
@@ -231,37 +283,53 @@
 	  (cond
 	    ((eql 'down edge)
 	     (when (and in-bounds? (listp subexpression))
-	       (try new-matching-state
+	       (try (new-matching-state)
 		    (appendf (matching-state-indices new-matching-state) '(0))
 		    dest)))
 	    ((eql 'up edge)
 	     (when (= (length (index-expression expression (butlast (matching-state-indices matching-state))))
-		      (car (last (matching-state-indices matching-state))))
-	       (try new-matching-state
+		      (if orderless?
+			  (1+ (length (get-orderless-visited matching-state)))
+			  (car (last (matching-state-indices matching-state)))))
+	       (try (new-matching-state)
 		    (setf (matching-state-indices new-matching-state) (butlast (matching-state-indices new-matching-state)))
 		    (incf-last-index new-matching-state)
 		    dest)))
 	    ((eql 'any edge)
-	     (when in-bounds?
-	       (try new-matching-state
-		    (incf-last-index new-matching-state)
-		    dest)))
+	     (if orderless?
+		 (try-orderless-possibilities (new-matching-state i)
+					      (lambda (_) (declare (ignore _)) t)
+					      (add-visited-index new-matching-state i)
+					      dest)
+		 (when in-bounds?
+		   (try (new-matching-state)
+			(incf-last-index new-matching-state)
+			dest))))
 	    ((and (listp edge) (eql 'quote (car edge)))
-	     (when (and in-bounds? (equal subexpression (second edge)))
-	       (try new-matching-state
-		    (incf-last-index new-matching-state)
-		    dest)))
+	     (if orderless?
+		 (try-orderless-possibilities (new-matching-state i)
+					      (lambda (x) (equal x (second edge)))
+					      (add-visited-index new-matching-state i)
+					      dest)
+		 (when (equal subexpression (second edge))
+		   (try (new-matching-state)
+			(incf-last-index new-matching-state)
+			dest))))
 	    ((and (listp edge) (eql 'start-var (car edge)))
-	     (try new-matching-state
-		  (push (cons (second edge) (car (last (matching-state-indices new-matching-state)))) (matching-state-var-starts new-matching-state))
+	     (try (new-matching-state)
+		  (push (cons (second edge)
+			      (if orderless?
+				  (length (get-orderless-visited new-matching-state))
+				  (car (last (matching-state-indices new-matching-state)))))
+			(matching-state-var-starts new-matching-state))
 		  dest))
 	    ((and (listp edge) (eql 'end-var (car edge)))
 	     (let* ((var (second edge))
-		    (capture (get-capture expression matching-state var)))
+		    (capture (get-capture expression matching-state var orderless?)))
 	       (if (member var (matching-state-captures matching-state) :key #'car)
 		   (when (equal capture (cdr (assoc var (matching-state-captures matching-state))))
-		     (try _ dest))
-		   (try new-matching-state
+		     (try (_) dest))
+		   (try (new-matching-state)
 			(push (cons var capture) (matching-state-captures new-matching-state))
 			dest))))))))))
 
