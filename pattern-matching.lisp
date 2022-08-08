@@ -1,8 +1,6 @@
-(ql:quickload '(:alexandria :cl-dot))
-
 (defpackage :pattern-matching
-  (:import-from :alexandria :appendf :when-let :if-let)
-  (:use cl))
+  (:use :cl)
+  (:import-from :alexandria :appendf :when-let :if-let :set-equal))
 
 (in-package :pattern-matching)
 
@@ -80,7 +78,7 @@
 
 (defvar *orderless-symbols* '(+ *))
 
-(defun orderless? (symbol)
+(defun is-orderless? (symbol)
   (member symbol *orderless-symbols*))
 
 (defun compile-orderless (n pattern current-state)
@@ -124,7 +122,7 @@
 	 (let ((start (new-state n))
 	       (end (new-state n)))
 	   (add-edge n current-state start (if orderless '(orderless down) 'down))
-	   (let ((pattern-orderless? (and (not (null pattern)) (orderless? (car pattern)))))
+	   (let ((pattern-orderless? (and (not (null pattern)) (is-orderless? (car pattern)))))
 	     (add-edge
 	      n
 	      (cond
@@ -235,9 +233,11 @@
 		   (mapcar (lambda (i) (elt up-level i)) (subseq (get-orderless-visited matching-state) start))
 		   (subseq up-level start (car (last (matching-state-indices matching-state)))))
 	       up-level))
-	 (capture (if (and (listp capture) (= 1 (length capture)))
-		      (car capture)
-		      `(sequence ,@ capture))))
+	 (capture (if (listp capture)
+		      (if (= 1 (length capture))
+			  (car capture)
+			  `(sequence ,@ capture))
+		      capture)))
     capture))
 
 (defun get-orderless-visited (matching-state)
@@ -282,10 +282,17 @@
 	       (edge (if orderless? (second edge) edge)))
 	  (cond
 	    ((eql 'down edge)
-	     (when (and in-bounds? (listp subexpression))
-	       (try (new-matching-state)
-		    (appendf (matching-state-indices new-matching-state) '(0))
-		    dest)))
+	     (if orderless?
+		 (try-orderless-possibilities (new-matching-state i)
+					      #'listp
+					      (add-visited-index new-matching-state i)
+					      (setf (car (last (matching-state-indices new-matching-state))) i)
+					      (appendf (matching-state-indices new-matching-state) '(0))
+					      dest)
+		 (when (and in-bounds? (listp subexpression))
+		   (try (new-matching-state)
+			(appendf (matching-state-indices new-matching-state) '(0))
+			dest))))
 	    ((eql 'up edge)
 	     (when (= (length (index-expression expression (butlast (matching-state-indices matching-state))))
 		      (if orderless?
@@ -339,6 +346,48 @@
 	     (when matched
 	       (return (values res matched))))
 	finally (return (values nil nil))))
+
+;;; Testing
+
+(defun captures-equal (a b)
+  (set-equal a b :test #'equal))
+
+(defmacro test-nfa (nfa &body test-forms)
+  `(let ((nfa (simplify-nfa (pattern->nfa ',nfa))))
+     ,@(loop for (kind pattern expected-captures) in test-forms
+	     collecting (case kind
+			  (:matches `(multiple-value-bind (captures matches?) (match nfa ',pattern)
+				       (assert (and matches? (captures-equal captures ',expected-captures)))))
+			  (:rejects `(multiple-value-bind (captures matches?) (match nfa ',pattern)
+				       (declare (ignore captures))
+				       (assert (not matches?))))))))
+
+(defun matching-tests ()
+  (test-nfa (f (pattern x (any)))
+    (:matches (f y) ((x . y)))
+    (:matches (f (g 1 2 3)) ((x . (g 1 2 3))))
+    (:rejects (g y)))
+  (test-nfa (pattern x (alternative a b))
+    (:matches a ((x . a)))
+    (:matches b ((x . b)))
+    (:rejects 1))
+  (test-nfa (+ (pattern x (repeated a)) b c)
+    (:matches (+ c a b a) ((x . (sequence a a))))
+    (:rejects (+ b c))
+    (:rejects (+ a a b)))
+  (test-nfa (+ 1 2 3)
+    (:matches (+ 3 2 1))
+    (:rejects (+ 1 2 3 4)))
+  (test-nfa (g (pattern x (any)) (pattern y (any)) (pattern z (any)))
+    (:matches (g 1 2 3) ((z . 3) (y . 2) (x . 1)))
+    (:rejects (g 1 2 3 4)))
+  (test-nfa (+ (pattern x (patternsequence 1 (any) 3)) a (pattern x (repeated (any))))
+    (:matches (+ 1 1 2 a 2 3 3) ((x . (sequence 1 2 3))))
+    (:rejects (+ 1 1 2 a 4 3 3))
+    (:rejects (+ 1 2 3 1 2 3))
+    (:rejects (+ 1 2 a 2 3 3)))
+  (test-nfa (+ 1 (+ a b) 3)
+    (:matches (+ (+ b a) 3 1))))
 
 ;;; Plot NFAs
 
