@@ -257,26 +257,23 @@
   (let ((depth (1- (length (matching-state-indices matching-state)))))
     (appendf (cdr (assoc depth (matching-state-orderless-visited matching-state))) (list index))))
 
-(defun match-rec (nfa state expression matching-state)
+(defun match-rec (nfa state expression matching-state found)
   (macrolet ((try ((new-matching-state) &body body)
 	       `(let ((,new-matching-state (deep-copy-matching-state matching-state)))
 		  (multiple-value-bind (res matched)
-		      (match-rec nfa (progn ,@body) expression ,new-matching-state)
+		      (match-rec nfa (progn ,@body) expression ,new-matching-state found)
 		    (when matched
-		      (return (values res matched))))))
+		      (funcall found res)))))
 	     (try-orderless-possibilities ((new-matching-state index) predicate &body body)
 	       `(let ((list (cdr (index-expression expression (butlast (matching-state-indices matching-state)))))
 		      (visited (get-orderless-visited matching-state)))
-		  (multiple-value-bind (res matched)
-		      (loop for elem in list and ,index from 1
-			    when (and (not (member ,index visited)) (funcall ,predicate elem))
-			      do (multiple-value-bind (res matched)
-				     (let ((,new-matching-state (deep-copy-matching-state matching-state)))
-				       (match-rec nfa (progn ,@body) expression ,new-matching-state))
-				   (when matched
-				     (return (values res matched)))))
-		    (when matched
-		      (return (values res matched)))))))
+		  (loop for elem in list and ,index from 1
+			when (and (not (member ,index visited)) (funcall ,predicate elem))
+			  do (multiple-value-bind (res matched)
+				 (let ((,new-matching-state (deep-copy-matching-state matching-state)))
+				   (match-rec nfa (progn ,@body) expression ,new-matching-state found))
+			       (when matched
+				 (funcall found res)))))))
     (multiple-value-bind (subexpression in-bounds?)
 	(index-expression expression (matching-state-indices matching-state))
       (dolist (transition (get-transitions nfa state)
@@ -347,27 +344,40 @@
 			(push (cons var capture) (matching-state-captures new-matching-state))
 			dest))))))))))
 
-(defun match (nfa expression)
+(defun match (nfa expression found)
   (loop for state in (get-initial-states nfa)
-	do (multiple-value-bind (res matched) (match-rec nfa state expression (make-matching-state))
-	     (when matched
-	       (return (values res matched))))
-	finally (return (values nil nil))))
+	do (match-rec nfa state expression (make-matching-state) found)))
+
+(defun first-match (nfa expression)
+  (match nfa expression (lambda (res) (return-from first-match (values res t))))
+  (values nil nil))
+
+(defun all-matches (nfa expression)
+  (let ((results '()))
+    (match nfa expression (lambda (res) (push res results)))
+    (if (null results)
+	(values nil nil)
+	(values (nreverse results) t))))
 
 ;;; Testing
 
 (defun captures-equal (a b)
   (set-equal a b :test #'equal))
 
+(defun all-captures-equal (a b)
+  (set-equal a b :test #'captures-equal))
+
 (defmacro test-pattern (pattern &body test-forms)
   `(let ((nfa (simplify-nfa (pattern->nfa ',pattern))))
-     ,@(loop for (kind expression expected-captures) in test-forms
+     ,@(loop for (kind expression expected) in test-forms
 	     collecting (case kind
-			  (:matches `(multiple-value-bind (captures matches?) (match nfa ',expression)
-				       (assert (and matches? (captures-equal captures ',expected-captures)))))
-			  (:rejects `(multiple-value-bind (captures matches?) (match nfa ',expression)
+			  (:matches `(multiple-value-bind (captures matches?) (first-match nfa ',expression)
+				       (assert (and matches? (captures-equal captures ',expected)))))
+			  (:rejects `(multiple-value-bind (captures matches?) (first-match nfa ',expression)
 				       (declare (ignore captures))
-				       (assert (not matches?))))))))
+				       (assert (not matches?))))
+			  (:matches-all `(multiple-value-bind (all-captures matches?) (all-matches nfa ',expression)
+					   (assert (and matches? (all-captures-equal all-captures ',expected)))))))))
 
 (defun test-matching ()
   (test-pattern (f (pattern x (any)))
@@ -397,7 +407,9 @@
     (:matches (+ (+ b a) 3 1)))
   (test-pattern (pattern x (f (repeated (any))))
     (:matches (f 1 2 3) ((x . (f 1 2 3))))
-    (:rejects (f))))
+    (:rejects (f)))
+  (test-pattern (+ (pattern x (any)) (pattern y (any)))
+    (:matches-all (+ a b) (((x . a) (y . b)) ((x . b) (y . a))))))
 
 ;;; Plot NFAs
 
