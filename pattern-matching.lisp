@@ -66,8 +66,13 @@
 
 ;;; Pattern -> NFA
 
-(defun make-edge (pattern)
-  `',pattern)
+(defun remove-nil-vals (plist)
+  (loop for (key val) on plist by #'cddr
+	when val
+	  appending (list key val)))
+
+(defun make-edge (name &rest plist)
+  (cons name (remove-nil-vals plist)))
 
 (defun compile-sequence (n sequence current-state &optional &key (orderless nil))
   (reduce
@@ -79,12 +84,14 @@
 (defvar *orderless-symbols* '(+ *))
 
 (defun is-orderless? (symbol)
-  (member symbol *orderless-symbols*))
+  (if (member symbol *orderless-symbols*) t nil))
 
 (defun compile-orderless (n pattern current-state)
   (let ((new-state (new-state n)))
-    (add-edge n current-state new-state (make-edge (car pattern)))
+    (add-edge n current-state new-state (make-edge :constant :value (car pattern)))
     (compile-sequence n (cdr pattern) new-state :orderless t)))
+
+(defconstant eps-edge (make-edge :eps))
 
 (defun compile-pattern (n pattern current-state &optional &key (orderless nil))
   (if (listp pattern)
@@ -93,45 +100,46 @@
 	 (let ((a (new-state n))
 	       (b (new-state n))
 	       (end (new-state n)))
-	   (add-edge n current-state a 'eps)
-	   (add-edge n current-state b 'eps)
-	   (add-edge n (compile-pattern n (second pattern) a :orderless orderless) end 'eps)
-	   (add-edge n (compile-pattern n (third pattern) b :orderless orderless) end 'eps)
+	   (add-edge n current-state a eps-edge)
+	   (add-edge n current-state b eps-edge)
+	   (add-edge n (compile-pattern n (second pattern) a :orderless orderless) end eps-edge)
+	   (add-edge n (compile-pattern n (third pattern) b :orderless orderless) end eps-edge)
 	   end))
 	(repeated
 	 (let* ((start (new-state n))
 		(end (new-state n))
 		(x (compile-pattern n (second pattern) start :orderless orderless)))
-	   (add-edge n current-state start 'eps)
-	   (add-edge n x start 'eps)
-	   (add-edge n x end 'eps)
+	   (add-edge n current-state start eps-edge)
+	   (add-edge n x start eps-edge)
+	   (add-edge n x end eps-edge)
 	   end))
 	(any
 	 (let ((end (new-state n)))
-	   (add-edge n current-state end (if orderless '(orderless any) 'any))
+	   (add-edge n current-state end (make-edge :any :orderless orderless))
 	   end))
 	(pattern
 	 (let ((start (new-state n))
 	       (end (new-state n)))
-	   (add-edge n current-state start (if orderless `(orderless (start-var ,(second pattern))) `(start-var ,(second pattern))))
-	   (add-edge n (compile-pattern n (third pattern) start :orderless orderless) end (if orderless `(orderless (end-var ,(second pattern))) `(end-var ,(second pattern))))
+	   (add-edge n current-state start (make-edge :start-var :var (second pattern) :orderless orderless))
+	   (add-edge n (compile-pattern n (third pattern) start :orderless orderless) end (make-edge :end-var :var (second pattern) :orderless orderless))
 	   end))
 	(patternsequence
 	 (compile-sequence n (cdr pattern) current-state :orderless orderless))
 	(otherwise
 	 (let ((start (new-state n))
 	       (end (new-state n)))
-	   (add-edge n current-state start (if orderless '(orderless down) 'down))
+	   (add-edge n current-state start (make-edge :down :orderless orderless))
 	   (let ((pattern-orderless? (and (not (null pattern)) (is-orderless? (car pattern)))))
 	     (add-edge
 	      n
 	      (cond
 		(pattern-orderless? (compile-orderless n pattern start))
 		(t (compile-sequence n pattern start)))
-	      end (if pattern-orderless? '(orderless up) 'up)))
+	      end
+	      (make-edge :up :orderless pattern-orderless?)))
 	   end)))
       (let ((next (new-state n)))
-	(add-edge n current-state next (if orderless `(orderless ,(make-edge pattern)) (make-edge pattern)))
+	(add-edge n current-state next (make-edge :constant :value pattern :orderless orderless))
 	next)))
 
 (defun pattern->nfa (pattern)
@@ -149,13 +157,13 @@
 	     (let ((recurse nil))
 	       (dolist (state (get-states n))
 		 (let* ((transitions (get-transitions n state))
-			(eps-transitions (remove-if-not (lambda (transition) (eql 'eps (car transition))) transitions)))
+			(eps-transitions (remove-if-not (lambda (transition) (eql :eps (caar transition))) transitions)))
 		   (unless (null eps-transitions)
 		     (setf recurse t))
-		   (loop for (_ . dest) in eps-transitions
+		   (loop for (edge . dest) in eps-transitions
 			 do (loop for (e . d) in (remove-duplicates (get-transitions n dest) :test #'equal)
 				  do (add-edge n state d e))
-			 do (remove-edge n state dest 'eps)
+			 do (remove-edge n state dest edge)
 			 when (is-initial-state? n state)
 			   do (add-initial-state n dest)
 			 when (is-final-state? n dest)
@@ -276,12 +284,12 @@
 	(index-expression expression (matching-state-indices matching-state))
       (dolist (transition (get-transitions nfa state)
 			  (values (matching-state-captures matching-state) (if (is-final-state? nfa state) t nil)))
-	(let* ((edge (car transition))
+	(let* ((edge (caar transition))
+	       (plist (cdar transition))
 	       (dest (cdr transition))
-	       (orderless? (and (listp edge) (eql 'orderless (car edge))))
-	       (edge (if orderless? (second edge) edge)))
-	  (cond
-	    ((eql 'down edge)
+	       (orderless? (getf plist :orderless)))
+	  (case edge
+	    (:down
 	     (if orderless?
 		 (try-orderless-possibilities (new-matching-state i)
 					      #'listp
@@ -293,7 +301,7 @@
 		   (try (new-matching-state)
 			(appendf (matching-state-indices new-matching-state) '(0))
 			dest))))
-	    ((eql 'up edge)
+	    (:up
 	     (when (= (length (index-expression expression (butlast (matching-state-indices matching-state))))
 		      (if orderless?
 			  (1+ (length (get-orderless-visited matching-state)))
@@ -302,7 +310,7 @@
 		    (setf (matching-state-indices new-matching-state) (butlast (matching-state-indices new-matching-state)))
 		    (incf-last-index new-matching-state)
 		    dest)))
-	    ((eql 'any edge)
+	    (:any
 	     (if orderless?
 		 (try-orderless-possibilities (new-matching-state i)
 					      (lambda (_) (declare (ignore _)) t)
@@ -312,26 +320,28 @@
 		   (try (new-matching-state)
 			(incf-last-index new-matching-state)
 			dest))))
-	    ((and (listp edge) (eql 'quote (car edge)))
-	     (if orderless?
-		 (try-orderless-possibilities (new-matching-state i)
-					      (lambda (x) (equal x (second edge)))
-					      (add-visited-index new-matching-state i)
-					      dest)
-		 (when (equal subexpression (second edge))
-		   (try (new-matching-state)
-			(incf-last-index new-matching-state)
-			dest))))
-	    ((and (listp edge) (eql 'start-var (car edge)))
-	     (try (new-matching-state)
-		  (push (cons (second edge)
-			      (if orderless?
-				  (length (get-orderless-visited new-matching-state))
-				  (car (last (matching-state-indices new-matching-state)))))
-			(matching-state-var-starts new-matching-state))
-		  dest))
-	    ((and (listp edge) (eql 'end-var (car edge)))
-	     (let* ((var (second edge))
+	    (:constant
+	     (let ((value (getf plist :value)))
+	       (if orderless?
+		   (try-orderless-possibilities (new-matching-state i)
+						(lambda (x) (equal x value))
+						(add-visited-index new-matching-state i)
+						dest)
+		   (when (equal subexpression value)
+		     (try (new-matching-state)
+			  (incf-last-index new-matching-state)
+			  dest)))))
+	    (:start-var
+	     (let ((var (getf plist :var)))
+	       (try (new-matching-state)
+		    (push (cons var
+				(if orderless?
+				    (length (get-orderless-visited new-matching-state))
+				    (car (last (matching-state-indices new-matching-state)))))
+			  (matching-state-var-starts new-matching-state))
+		    dest)))
+	    (:end-var
+	     (let* ((var (getf plist :var))
 		    (capture (get-capture expression matching-state var orderless?)))
 	       (if (member var (matching-state-captures matching-state) :key #'car)
 		   (when (equal capture (cdr (assoc var (matching-state-captures matching-state))))
@@ -401,7 +411,7 @@
 
 (defmethod cl-dot:graph-object-edges ((graph nfa))
   (loop for state being the hash-keys in (states graph) using (hash-value v)
-	appending (mapcar (lambda (x) (list state (cdr x) `(:label ,(format nil "~a" (car x))))) v)))
+	appending (mapcar (lambda (x) (list state (cdr x) `(:label ,(format nil "~{~s~^ ~}" (car x))))) v)))
 
 (defmethod draw-nfa ((n nfa))
   (let ((cl-dot:*dot-path* "/usr/local/bin/dot"))
