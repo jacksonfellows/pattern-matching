@@ -233,24 +233,21 @@
 	  (index-expression (elt expression (car indices)) (cdr indices)))))
 
 (defun get-capture (expression matching-state var orderless?)
-  (let* ((up-level (index-expression expression (butlast (matching-state-indices matching-state))))
-	 (start (cdr (assoc var (matching-state-var-starts matching-state))))
-	 (capture
-	   (if (listp up-level)
-	       (if orderless?
-		   (mapcar (lambda (i) (elt up-level i)) (subseq (get-orderless-visited matching-state) start))
-		   (subseq up-level start (car (last (matching-state-indices matching-state)))))
-	       up-level))
-	 (capture (if (listp capture)
-		      (if (= 1 (length capture))
-			  (car capture)
-			  `(sequence ,@ capture))
-		      capture)))
-    capture))
+  (if-let (start (cdr (assoc var (matching-state-var-starts matching-state))))
+    (let* ((up-level (index-expression expression (butlast (matching-state-indices matching-state))))
+	   (sequence (if orderless?
+			 (mapcar (lambda (i) (elt up-level i)) (subseq (get-orderless-visited matching-state) start))
+			 (subseq up-level start (car (last (matching-state-indices matching-state))))))
+	   (capture (if (= 1 (length sequence))
+			(car sequence)
+			`(sequence ,@sequence))))
+      capture)
+    ;; start is nil -> capture whole expression
+    expression))
 
 (defun get-orderless-visited (matching-state)
   (let ((depth (1- (length (matching-state-indices matching-state)))))
-    (if-let ((visited (cdr (assoc depth (matching-state-orderless-visited matching-state)))))
+    (if-let (visited (cdr (assoc depth (matching-state-orderless-visited matching-state))))
       visited
       (let ((visited '()))
 	(push (cons depth visited) (matching-state-orderless-visited matching-state))
@@ -397,7 +394,10 @@
     (:rejects (+ 1 2 3 1 2 3))
     (:rejects (+ 1 2 a 2 3 3)))
   (test-nfa (+ 1 (+ a b) 3)
-    (:matches (+ (+ b a) 3 1))))
+    (:matches (+ (+ b a) 3 1)))
+  (test-nfa (pattern x (f (repeated (any))))
+    (:matches (f 1 2 3) ((x . (f 1 2 3))))
+    (:rejects (f))))
 
 ;;; Plot NFAs
 
