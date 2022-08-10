@@ -409,7 +409,9 @@
     (:matches (f 1 2 3) ((x . (f 1 2 3))))
     (:rejects (f)))
   (test-pattern (+ (pattern x (any)) (pattern y (any)))
-    (:matches-all (+ a b) (((x . a) (y . b)) ((x . b) (y . a))))))
+    (:matches-all (+ a b) (((x . a) (y . b)) ((x . b) (y . a)))))
+  (test-pattern (f (pattern x (patternsequence 1 (pattern y (patternsequence 2 3)) 4)))
+    (:matches (f 1 2 3 4) ((x . (sequence 1 2 3 4)) (y . (sequence 2 3))))))
 
 ;;; Plot NFAs
 
