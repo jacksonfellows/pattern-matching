@@ -208,145 +208,92 @@
 ;;; Match NFA
 
 (defstruct matching-state
-  (indices '())
-  (var-starts '())
-  (captures '())
-  (orderless-visited '()))
+  expression
+  (visited-indices '())
+  (var-starts '()))
 
-(defun deep-copy-matching-state (matching-state)
-  (let ((copy (copy-matching-state matching-state)))
-    (setf (matching-state-indices copy) (copy-list (matching-state-indices copy)))
-    (setf (matching-state-var-starts copy) (copy-alist (matching-state-var-starts copy)))
-    (setf (matching-state-captures copy) (copy-alist (matching-state-captures copy)))
-    (setf (matching-state-orderless-visited copy) (copy-alist (matching-state-orderless-visited copy)))
-    copy))
+(defun visit-index (matching-state index)
+  (let ((new-matching-state (copy-matching-state matching-state)))
+    (setf (matching-state-visited-indices new-matching-state)
+	  (cons index (copy-list (matching-state-visited-indices new-matching-state))))
+    new-matching-state))
 
-(defun incf-last-index (matching-state)
-  (unless (null (matching-state-indices matching-state))
-    (incf (car (last (matching-state-indices matching-state))))))
+(defun add-var-start (matching-state var)
+  (let ((new-matching-state (copy-matching-state matching-state)))
+    (setf (matching-state-var-starts new-matching-state)
+	  (cons (cons var (length (matching-state-visited-indices new-matching-state)))
+		(copy-list (matching-state-var-starts new-matching-state))))
+    new-matching-state))
 
-(defun index-expression (expression indices)
-  (if (null indices)
-      (values expression t)
-      (if (or (not (listp expression)) (>= (car indices) (length expression)))
-	  (values nil nil)
-	  (index-expression (elt expression (car indices)) (cdr indices)))))
+(defun last-index (matching-state)
+  (car (matching-state-visited-indices matching-state)))
 
-(defun get-capture (expression matching-state var orderless?)
-  (if-let (start (cdr (assoc var (matching-state-var-starts matching-state))))
-    (let* ((up-level (index-expression expression (butlast (matching-state-indices matching-state))))
-	   (sequence (if orderless?
-			 (mapcar (lambda (i) (elt up-level i)) (subseq (get-orderless-visited matching-state) start))
-			 (subseq up-level start (car (last (matching-state-indices matching-state))))))
-	   (capture (if (= 1 (length sequence))
-			(car sequence)
-			`(sequence ,@sequence))))
-      capture)
-    ;; start is nil -> capture whole expression
-    expression))
+(defun unvisited-indices (matching-state)
+  (loop for i from 0 below (length (matching-state-expression matching-state))
+	unless (member i (matching-state-visited-indices matching-state))
+	  collect i))
 
-(defun get-orderless-visited (matching-state)
-  (let ((depth (1- (length (matching-state-indices matching-state)))))
-    (if-let (visited (cdr (assoc depth (matching-state-orderless-visited matching-state))))
-      visited
-      (let ((visited '()))
-	(push (cons depth visited) (matching-state-orderless-visited matching-state))
-	visited))))
+(defun get-capture (matching-state var)
+  (let* ((start (cdr (assoc var (matching-state-var-starts matching-state))))
+	 (indices (subseq (matching-state-visited-indices matching-state) 0 (- (length (matching-state-visited-indices matching-state)) start)))
+	 (capture-seq (nreverse (mapcar (lambda (i) (elt (matching-state-expression matching-state) i)) indices)))
+	 (capture (if (= (length capture-seq) 1)
+		      (car capture-seq)
+		      `(sequence ,@capture-seq))))
+    capture))
 
-(defun add-visited-index (matching-state index)
-  (let ((depth (1- (length (matching-state-indices matching-state)))))
-    (appendf (cdr (assoc depth (matching-state-orderless-visited matching-state))) (list index))))
-
-(defun match-rec (nfa state expression matching-state found)
-  (macrolet ((try ((new-matching-state) &body body)
-	       `(let ((,new-matching-state (deep-copy-matching-state matching-state)))
-		  (multiple-value-bind (res matched)
-		      (match-rec nfa (progn ,@body) expression ,new-matching-state found)
-		    (when matched
-		      (funcall found res)))))
-	     (try-orderless-possibilities ((new-matching-state index) predicate &body body)
-	       `(let ((list (cdr (index-expression expression (butlast (matching-state-indices matching-state)))))
-		      (visited (get-orderless-visited matching-state)))
-		  (loop for elem in list and ,index from 1
-			when (and (not (member ,index visited)) (funcall ,predicate elem))
-			  do (multiple-value-bind (res matched)
-				 (let ((,new-matching-state (deep-copy-matching-state matching-state)))
-				   (match-rec nfa (progn ,@body) expression ,new-matching-state found))
-			       (when matched
-				 (funcall found res)))))))
-    (multiple-value-bind (subexpression in-bounds?)
-	(index-expression expression (matching-state-indices matching-state))
-      (dolist (transition (get-transitions nfa state)
-			  (values (matching-state-captures matching-state) (if (is-final-state? nfa state) t nil)))
+(defun match-rec (nfa state matching-state-stack captures found)
+  (macrolet ((do-next ((expression index) &body body)
+	       `(dolist (,index (if orderless?
+				    (unvisited-indices matching-state)
+				    (let ((next-index (1+ (last-index matching-state))))
+				      (when (< next-index (length (matching-state-expression matching-state)))
+					(list next-index)))))
+		  (let ((,expression (elt (matching-state-expression matching-state) ,index)))
+		    ,@body))))
+    (let ((matching-state (car matching-state-stack)))
+      (dolist (transition (get-transitions nfa state))
 	(let* ((edge (caar transition))
 	       (plist (cdar transition))
 	       (dest (cdr transition))
 	       (orderless? (getf plist :orderless)))
-	  (case edge
-	    (:down
-	     (if orderless?
-		 (try-orderless-possibilities (new-matching-state i)
-					      #'listp
-					      (add-visited-index new-matching-state i)
-					      (setf (car (last (matching-state-indices new-matching-state))) i)
-					      (appendf (matching-state-indices new-matching-state) '(0))
-					      dest)
-		 (when (and in-bounds? (listp subexpression))
-		   (try (new-matching-state)
-			(appendf (matching-state-indices new-matching-state) '(0))
-			dest))))
-	    (:up
-	     (when (= (length (index-expression expression (butlast (matching-state-indices matching-state))))
-		      (if orderless?
-			  (1+ (length (get-orderless-visited matching-state)))
-			  (car (last (matching-state-indices matching-state)))))
-	       (try (new-matching-state)
-		    (setf (matching-state-indices new-matching-state) (butlast (matching-state-indices new-matching-state)))
-		    (incf-last-index new-matching-state)
-		    dest)))
-	    (:any
-	     (if orderless?
-		 (try-orderless-possibilities (new-matching-state i)
-					      (lambda (_) (declare (ignore _)) t)
-					      (add-visited-index new-matching-state i)
-					      dest)
-		 (when in-bounds?
-		   (try (new-matching-state)
-			(incf-last-index new-matching-state)
-			dest))))
-	    (:constant
-	     (let ((value (getf plist :value)))
-	       (if orderless?
-		   (try-orderless-possibilities (new-matching-state i)
-						(lambda (x) (equal x value))
-						(add-visited-index new-matching-state i)
-						dest)
-		   (when (equal subexpression value)
-		     (try (new-matching-state)
-			  (incf-last-index new-matching-state)
-			  dest)))))
-	    (:start-var
-	     (let ((var (getf plist :var)))
-	       (try (new-matching-state)
-		    (push (cons var
-				(if orderless?
-				    (length (get-orderless-visited new-matching-state))
-				    (car (last (matching-state-indices new-matching-state)))))
-			  (matching-state-var-starts new-matching-state))
-		    dest)))
-	    (:end-var
-	     (let* ((var (getf plist :var))
-		    (capture (get-capture expression matching-state var orderless?)))
-	       (if (member var (matching-state-captures matching-state) :key #'car)
-		   (when (equal capture (cdr (assoc var (matching-state-captures matching-state))))
-		     (try (_) dest))
-		   (try (new-matching-state)
-			(push (cons var capture) (matching-state-captures new-matching-state))
-			dest))))))))))
+	  (flet ((consume-next-if (predicate)
+		   (do-next (expression index)
+		     (when (funcall predicate expression)
+		       (let ((new-matching-state (visit-index matching-state index)))
+			 (match-rec nfa dest (cons new-matching-state (cdr matching-state-stack)) captures found))))))
+	    (ecase edge
+	      (:down
+	       (let ((head (getf plist :head)))
+		 (do-next (expression index)
+		   (when (and (listp expression) (eql head (car expression)))
+		     (let ((new-matching-state (make-matching-state :expression expression :visited-indices '(0))))
+		       (match-rec nfa dest (cons new-matching-state (cons (visit-index matching-state index) (cdr matching-state-stack))) captures found))))))
+	      (:up
+	       (when (= (length (matching-state-expression matching-state)) (length (matching-state-visited-indices matching-state)))
+		 (match-rec nfa dest (cdr matching-state-stack) captures found)))
+	      (:any
+	       (consume-next-if (lambda (_) (declare (ignore _)) t)))
+	      (:constant
+	       (let ((value (getf plist :value)))
+		 (consume-next-if (lambda (x) (equal value x)))))
+	      (:start-var
+	       (let* ((var (getf plist :var))
+		      (new-matching-state (add-var-start matching-state var)))
+		 (match-rec nfa dest (cons new-matching-state (cdr matching-state-stack)) captures found)))
+	      (:end-var
+	       (let* ((var (getf plist :var))
+		      (capture (get-capture matching-state var)))
+		 (if-let (old-capture (cdr (assoc var captures)))
+		   (when (equal capture old-capture)
+		     (match-rec nfa dest matching-state-stack captures found))
+		   (match-rec nfa dest matching-state-stack (cons (cons var capture) (copy-alist captures)) found))))))))
+      (when (is-final-state? nfa state)
+	(funcall found captures)))))
 
 (defun match (nfa expression found)
   (loop for state in (get-initial-states nfa)
-	do (match-rec nfa state expression (make-matching-state) found)))
+	do (match-rec nfa state (list (make-matching-state :expression (list nil expression) :visited-indices '(0))) '() found)))
 
 (defun first-match (nfa expression)
   (match nfa expression (lambda (res) (return-from first-match (values res t))))
