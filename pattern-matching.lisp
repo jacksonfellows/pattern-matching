@@ -74,26 +74,24 @@
 (defun make-edge (name &rest plist)
   (cons name (remove-nil-vals plist)))
 
-(defun compile-sequence (n sequence current-state &optional &key (orderless nil))
+(defun compile-sequence (n sequence current-state &optional &key (orderless nil) (flat nil) (one-identity nil))
   (reduce
    (lambda (state subpattern)
-     (compile-pattern n subpattern state :orderless orderless))
+     (compile-pattern n subpattern state :orderless orderless :flat flat :one-identity one-identity))
    sequence
    :initial-value current-state))
 
-(defvar *orderless-symbols* '(+ *))
+(defvar *symbol-attributes*
+  '((+ . (orderless flat one-identity))
+    (* . (orderless flat one-identity))
+    (dot . (flat one-identity))))
 
-(defun is-orderless? (symbol)
-  (if (member symbol *orderless-symbols*) t nil))
-
-(defun compile-orderless (n pattern current-state)
-  (let ((new-state (new-state n)))
-    (add-edge n current-state new-state (make-edge :constant :value (car pattern)))
-    (compile-sequence n (cdr pattern) new-state :orderless t)))
+(defun has-attribute? (symbol attribute)
+  (if (member attribute (cdr (assoc symbol *symbol-attributes*))) t nil))
 
 (defconstant eps-edge (make-edge :eps))
 
-(defun compile-pattern (n pattern current-state &optional &key (orderless nil))
+(defun compile-pattern (n pattern current-state &optional &key (orderless nil) (flat nil) (one-identity nil))
   (if (listp pattern)
       (case (car pattern)
 	(alternative
@@ -102,41 +100,56 @@
 	       (end (new-state n)))
 	   (add-edge n current-state a eps-edge)
 	   (add-edge n current-state b eps-edge)
-	   (add-edge n (compile-pattern n (second pattern) a :orderless orderless) end eps-edge)
-	   (add-edge n (compile-pattern n (third pattern) b :orderless orderless) end eps-edge)
+	   (add-edge n (compile-pattern n (second pattern) a :orderless orderless :flat flat :one-identity one-identity) end eps-edge)
+	   (add-edge n (compile-pattern n (third pattern) b :orderless orderless :flat flat :one-identity one-identity) end eps-edge)
 	   end))
 	(repeated
 	 (let* ((start (new-state n))
 		(end (new-state n))
-		(x (compile-pattern n (second pattern) start :orderless orderless)))
+		(x (compile-pattern n (second pattern) start :orderless orderless :flat flat :one-identity one-identity)))
 	   (add-edge n current-state start eps-edge)
 	   (add-edge n x start eps-edge)
 	   (add-edge n x end eps-edge)
 	   end))
 	(any
-	 (let ((end (new-state n)))
-	   (add-edge n current-state end (make-edge :any :orderless orderless))
-	   end))
+	 (if flat
+	     (let ((start (new-state n))
+		   (end (new-state n))
+		   (end2 (new-state n)))
+	       ;; flat (repeated (any))
+	       (add-edge n current-state start (make-edge :start-flat))
+	       (add-edge n start end (make-edge :any :orderless orderless))
+	       (when one-identity
+		 (let ((end1 (new-state n)))
+		   (add-edge n end end1 (make-edge :any :orderless orderless))
+		   (setf end end1)))
+	       (add-edge n end end (make-edge :any :orderless orderless))
+	       (add-edge n end end2 (make-edge :end-flat))
+	       ;; or (any)
+	       (add-edge n current-state end2 (make-edge :any :orderless orderless))
+	       end2)
+	     (let ((end (new-state n)))
+	       (add-edge n current-state end (make-edge :any :orderless orderless))
+	       end)))
 	(pattern
 	 (let ((start (new-state n))
 	       (end (new-state n)))
 	   (add-edge n current-state start (make-edge :start-var :var (second pattern) :orderless orderless))
-	   (add-edge n (compile-pattern n (third pattern) start :orderless orderless) end (make-edge :end-var :var (second pattern) :orderless orderless))
+	   (add-edge n (compile-pattern n (third pattern) start :orderless orderless :flat flat :one-identity one-identity) end (make-edge :end-var :var (second pattern) :orderless orderless))
 	   end))
 	(patternsequence
-	 (compile-sequence n (cdr pattern) current-state :orderless orderless))
+	 (compile-sequence n (cdr pattern) current-state :orderless orderless :flat flat :one-identity one-identity))
 	(otherwise
 	 (let ((start (new-state n))
 	       (end (new-state n)))
-	   (add-edge n current-state start (make-edge :down :orderless orderless))
-	   (let ((pattern-orderless? (and (not (null pattern)) (is-orderless? (car pattern)))))
-	     (add-edge
-	      n
-	      (cond
-		(pattern-orderless? (compile-orderless n pattern start))
-		(t (compile-sequence n pattern start)))
+	   (add-edge n current-state start (make-edge :down :orderless orderless :head (car pattern)))
+	   (let ((pattern-orderless? (has-attribute? (car pattern) 'orderless))
+		 (pattern-flat? (has-attribute? (car pattern) 'flat))
+		 (pattern-one-identity? (has-attribute? (car pattern) 'one-identity)))
+	     (add-edge n
+	      (compile-sequence n (cdr pattern) start :orderless pattern-orderless? :flat pattern-flat? :one-identity pattern-one-identity?)
 	      end
-	      (make-edge :up :orderless pattern-orderless?)))
+	      (make-edge :up)))
 	   end)))
       (let ((next (new-state n)))
 	(add-edge n current-state next (make-edge :constant :value pattern :orderless orderless))
@@ -210,7 +223,8 @@
 (defstruct matching-state
   expression
   (visited-indices '())
-  (var-starts '()))
+  (var-starts '())
+  (flat-ranges '()))
 
 (defun visit-index (matching-state index)
   (let ((new-matching-state (copy-matching-state matching-state)))
@@ -225,6 +239,13 @@
 		(copy-list (matching-state-var-starts new-matching-state))))
     new-matching-state))
 
+(defun add-flat-range (matching-state)
+  (let ((new-matching-state (copy-matching-state matching-state)))
+    (setf (matching-state-flat-ranges new-matching-state)
+	  (cons (length (matching-state-visited-indices new-matching-state))
+		(copy-list (matching-state-flat-ranges new-matching-state))))
+    new-matching-state))
+
 (defun last-index (matching-state)
   (car (matching-state-visited-indices matching-state)))
 
@@ -235,12 +256,23 @@
 
 (defun get-capture (matching-state var)
   (let* ((start (cdr (assoc var (matching-state-var-starts matching-state))))
-	 (indices (subseq (matching-state-visited-indices matching-state) 0 (- (length (matching-state-visited-indices matching-state)) start)))
-	 (capture-seq (nreverse (mapcar (lambda (i) (elt (matching-state-expression matching-state) i)) indices)))
-	 (capture (if (= (length capture-seq) 1)
-		      (car capture-seq)
-		      `(sequence ,@capture-seq))))
-    capture))
+	 (indices (nreverse (subseq (matching-state-visited-indices matching-state) 0 (- (length (matching-state-visited-indices matching-state)) start))))
+	 (capture-seq (mapcar (lambda (i) (elt (matching-state-expression matching-state) i)) indices))
+	 (capture-seq-flats
+	   (loop for (e s) on (matching-state-flat-ranges matching-state) by #'cddr
+		 for flat-start = (- (length (matching-state-visited-indices matching-state)) e)
+		 for flat-end = (- (length (matching-state-visited-indices matching-state)) s)
+		 with last = 0
+		 when (<= flat-end (length capture-seq))
+		   append (subseq capture-seq last flat-start) into r
+		   and collect (cons (car (matching-state-expression matching-state)) (subseq capture-seq flat-start flat-end)) into r
+		   and do (setf last flat-end)
+		 finally
+		    (return (append r (subseq capture-seq last)))))
+	 (capture (if capture-seq-flats capture-seq-flats capture-seq)))
+    (if (= (length capture) 1)
+	(car capture)
+	`(sequence ,@capture))))
 
 (defun match-rec (nfa state matching-state-stack captures found)
   (macrolet ((do-next ((expression index) &body body)
@@ -287,7 +319,11 @@
 		 (if-let (old-capture (cdr (assoc var captures)))
 		   (when (equal capture old-capture)
 		     (match-rec nfa dest matching-state-stack captures found))
-		   (match-rec nfa dest matching-state-stack (cons (cons var capture) (copy-alist captures)) found))))))))
+		   (match-rec nfa dest matching-state-stack (cons (cons var capture) (copy-alist captures)) found))))
+	      (:start-flat
+	       (match-rec nfa dest (cons (add-flat-range matching-state) (cdr matching-state-stack)) captures found))
+	      (:end-flat
+	       (match-rec nfa dest (cons (add-flat-range matching-state) (cdr matching-state-stack)) captures found))))))
       (when (is-final-state? nfa state)
 	(funcall found captures)))))
 
@@ -358,7 +394,15 @@
   (test-pattern (+ (pattern x (any)) (pattern y (any)))
     (:matches-all (+ a b) (((x . a) (y . b)) ((x . b) (y . a)))))
   (test-pattern (f (pattern x (patternsequence 1 (pattern y (patternsequence 2 3)) 4)))
-    (:matches (f 1 2 3 4) ((x . (sequence 1 2 3 4)) (y . (sequence 2 3))))))
+    (:matches (f 1 2 3 4) ((x . (sequence 1 2 3 4)) (y . (sequence 2 3)))))
+  (test-pattern (dot a (pattern x (any)))
+    (:matches (dot a b c) ((x . (dot b c)))))
+  (test-pattern (dot (pattern x (patternsequence a (any) d)))
+    (:matches (dot a b d) ((x . (sequence a b d))))
+    (:matches (dot a b c d) ((x . (sequence a (dot b c) d)))))
+  (test-pattern (dot (any) (pattern x (any)) (any))
+    (:matches (dot a b c) ((x . b)))
+    (:matches-all (dot a b c d) (((x . b)) ((x . (dot b c))) ((x . c))))))
 
 ;;; Plot NFAs
 
