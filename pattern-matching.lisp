@@ -1,6 +1,6 @@
 (defpackage :pattern-matching
   (:use :cl)
-  (:import-from :alexandria :appendf :when-let :if-let :set-equal))
+  (:import-from :alexandria :if-let :set-equal))
 
 (in-package :pattern-matching)
 
