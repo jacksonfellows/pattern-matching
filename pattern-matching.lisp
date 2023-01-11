@@ -81,13 +81,13 @@
    sequence
    :initial-value current-state))
 
-(defvar *symbol-attributes*
-  '((+ . (orderless flat one-identity))
-    (* . (orderless flat one-identity))
-    (dot . (flat one-identity))))
+(defvar *head-attributes* (alexandria:alist-hash-table
+			   '((+ . (orderless flat one-identity))
+			     (* . (orderless flat one-identity))
+			     (dot . (flat one-identity)))))
 
 (defun has-attribute? (symbol attribute)
-  (if (member attribute (cdr (assoc symbol *symbol-attributes*))) t nil))
+  (if (member attribute (gethash symbol *head-attributes*)) t nil))
 
 (defconstant eps-edge (make-edge :eps))
 
@@ -137,7 +137,7 @@
 	   (add-edge n current-state start (make-edge :start-var :var (second pattern) :orderless orderless))
 	   (add-edge n (compile-pattern n (third pattern) start :orderless orderless :flat flat :one-identity one-identity) end (make-edge :end-var :var (second pattern) :orderless orderless))
 	   end))
-	(patternsequence
+	(pattern-sequence
 	 (compile-sequence n (cdr pattern) current-state :orderless orderless :flat flat :one-identity one-identity))
 	(otherwise
 	 (let ((start (new-state n))
@@ -160,7 +160,7 @@
 	 (initial (new-state n)))
     (add-initial-state n initial)
     (add-final-state n (compile-pattern n pattern initial))
-    n))
+    (simplify-nfa n)))
 
 ;;; Optimize/simplify NFAs
 ;;; TODO: combine equivalent states
@@ -331,6 +331,8 @@
   (loop for state in (get-initial-states nfa)
 	do (match-rec nfa state (list (make-matching-state :expression (list nil expression) :visited-indices '(0))) '() found)))
 
+;;; Get captures
+
 (defun first-match (nfa expression)
   (match nfa expression (lambda (res) (return-from first-match (values res t))))
   (values nil nil))
@@ -353,7 +355,7 @@
 (defmacro test-pattern (pattern &body test-forms)
   `(let ((nfa (simplify-nfa (pattern->nfa ',pattern))))
      ,@(loop for (kind expression expected) in test-forms
-	     collecting (case kind
+	     collecting (ecase kind
 			  (:matches `(multiple-value-bind (captures matches?) (first-match nfa ',expression)
 				       (assert (and matches? (captures-equal captures ',expected)))))
 			  (:rejects `(multiple-value-bind (captures matches?) (first-match nfa ',expression)
@@ -381,7 +383,7 @@
   (test-pattern (g (pattern x (blank)) (pattern y (blank)) (pattern z (blank)))
     (:matches (g 1 2 3) ((z . 3) (y . 2) (x . 1)))
     (:rejects (g 1 2 3 4)))
-  (test-pattern (+ (pattern x (patternsequence 1 (blank) 3)) a (pattern x (repeated (blank))))
+  (test-pattern (+ (pattern x (pattern-sequence 1 (blank) 3)) a (pattern x (repeated (blank))))
     (:matches (+ 1 1 2 a 2 3 3) ((x . (sequence 1 2 3))))
     (:rejects (+ 1 1 2 a 4 3 3))
     (:rejects (+ 1 2 3 1 2 3))
@@ -393,16 +395,54 @@
     (:rejects (f)))
   (test-pattern (+ (pattern x (blank)) (pattern y (blank)))
     (:matches-all (+ a b) (((x . a) (y . b)) ((x . b) (y . a)))))
-  (test-pattern (f (pattern x (patternsequence 1 (pattern y (patternsequence 2 3)) 4)))
+  (test-pattern (f (pattern x (pattern-sequence 1 (pattern y (pattern-sequence 2 3)) 4)))
     (:matches (f 1 2 3 4) ((x . (sequence 1 2 3 4)) (y . (sequence 2 3)))))
   (test-pattern (dot a (pattern x (blank)))
     (:matches (dot a b c) ((x . (dot b c)))))
-  (test-pattern (dot (pattern x (patternsequence a (blank) d)))
+  (test-pattern (dot (pattern x (pattern-sequence a (blank) d)))
     (:matches (dot a b d) ((x . (sequence a b d))))
     (:matches (dot a b c d) ((x . (sequence a (dot b c) d)))))
   (test-pattern (dot (blank) (pattern x (blank)) (blank))
     (:matches (dot a b c) ((x . b)))
     (:matches-all (dot a b c d) (((x . b)) ((x . (dot b c))) ((x . c))))))
+
+;;; Definitions
+
+(defvar *head-rules* (make-hash-table))
+
+(defun add-definition (symbol pattern replacement)
+  (let ((nfa (pattern->nfa pattern)))
+    (if-let (defs (gethash symbol *head-rules*))
+      (push (cons nfa replacement) defs)
+      (setf (gethash symbol *head-rules*) (cons nfa replacement)))))
+
+;;; "Variables"
+
+(defvar *symbol-replacements* (make-hash-table))
+
+(defun add-symbol-replacement (symbol replacement)
+  (setf (gethash symbol *symbol-replacements*) replacement))
+
+;;; Eval
+
+(defun evaluate-atom (atom)
+  (multiple-value-bind (replacement exists) (gethash atom *symbol-replacements*)
+    (if exists replacement atom)))
+
+(defun evaluate-expression (expression)
+  (if (listp expression)
+      (let (
+	    ;; Only support hold-all for now
+	    (hold-all? (has-attribute? (car expression) 'hold-all)))
+	(unless hold-all?
+	  (setf expression (mapcar #'evaluate-expression expression)))
+	;; Handle "built-ins" first
+	(ecase (car expression)
+	  (set-delayed (progn
+			 (add-definition (second expression) (third expression))
+			 nil))
+	  (otherwise )))
+      (evaluate-atom expression)))
 
 ;;; Plot NFAs
 
